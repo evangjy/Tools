@@ -21,3 +21,5 @@ For Microsoft Translator, provide the Azure Translator key and resource region.
 For Google, enable Cloud Translation API and provide an API key permitted to call it.
 For Baidu, provide APP ID and Secret Key for the translation service.
 For Alibaba Cloud, provide AccessKey ID and AccessKey Secret with Machine Translation permission.
+
+Usage: Run `install.bat` to install dependencies, then drag the English e-book onto `run_translate.bat` to start the translation task.
