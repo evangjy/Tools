@@ -36,6 +36,15 @@ class ProviderError(RuntimeError):
     pass
 
 
+class TranslationPartialError(RuntimeError):
+    """Wrap a translation failure together with the latest valid EPUB state."""
+    def __init__(self, cause, partial_epub=None, translated_any=False):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.partial_epub = partial_epub
+        self.translated_any = translated_any
+
+
 def die(msg):
     print(f'[ERROR] {msg}')
     return 1
@@ -552,15 +561,136 @@ def _aliyun_looks_untranslated(source, translated):
     return bool(re.search(r'[A-Za-z]{3,}\s+[A-Za-z]{3,}', s))
 
 
-def check_aliyun(c):
-    sample = 'This is a short sentence used only to verify the connection.'
-    d = aliyun_rpc(c, 'TranslateGeneral', {
+ALIBABA_ENGINES = {
+    '1': {
+        'name': 'General-purpose Edition',
+        'action': 'TranslateGeneral',
+        'api_name': 'translate_standard',
+        'scene': 'general',
+    },
+    '2': {
+        'name': 'Professional Edition',
+        'action': 'Translate',
+        'api_name': 'translate_ecommerce',
+        # For ordinary book prose, social is the closest supported
+        # Professional Edition scene. The user can change it below.
+        'scene': 'social',
+    },
+}
+
+
+def choose_aliyun_engine():
+    print('\nAlibaba Cloud Machine Translation engine:')
+    print('  [1] General-purpose Edition  (TranslateGeneral)')
+    print('  [2] Professional Edition     (Translate)')
+    choice = input('Select engine [1-2]: ').strip()
+    if choice not in ALIBABA_ENGINES:
+        raise ValueError('Invalid Alibaba Cloud engine selection.')
+    engine = dict(ALIBABA_ENGINES[choice])
+
+    if choice == '2':
+        print('\nProfessional Edition scene:')
+        print('  [1] social         - general social/communication prose')
+        print('  [2] description    - descriptive text')
+        print('  [3] communication  - dialogue/communication')
+        print('  [4] title          - titles')
+        print('  [5] medical        - medical content')
+        scene_choice = input('Select scene [1-5] (default 1): ').strip() or '1'
+        scenes = {'1': 'social', '2': 'description', '3': 'communication',
+                  '4': 'title', '5': 'medical'}
+        if scene_choice not in scenes:
+            raise ValueError('Invalid Professional Edition scene selection.')
+        engine['scene'] = scenes[scene_choice]
+
+    print(f'[INFO] Alibaba engine: {engine["name"]} / scene={engine["scene"]}')
+    return engine
+
+
+def aliyun_rpc(c, action, params):
+    endpoint = 'https://mt.cn-hangzhou.aliyuncs.com/'
+    common = {
+        'AccessKeyId': c['access_key_id'],
+        'Action': action,
+        'Format': 'JSON',
+        'RegionId': c['region'],
+        'SignatureMethod': 'HMAC-SHA1',
+        'SignatureNonce': f'{time.time_ns()}{os.getpid()}',
+        'SignatureVersion': '1.0',
+        'Timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'Version': '2018-10-12',
+    }
+    common.update(params)
+
+    qs = '&'.join(
+        f'{percent_encode(k)}={percent_encode(common[k])}'
+        for k in sorted(common)
+    )
+    signstr = 'POST&%2F&' + percent_encode(qs)
+    key = c['access_key_secret'] + '&'
+    sig = base64.b64encode(
+        hmac.new(key.encode(), signstr.encode(), hashlib.sha1).digest()
+    ).decode()
+    common['Signature'] = sig
+
+    r = requests.post(
+        endpoint,
+        data=common,
+        headers={'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'},
+        timeout=90,
+    )
+    if r.status_code >= 400:
+        _response_error('Alibaba Cloud MT', r)
+
+    try:
+        d = r.json()
+    except ValueError as e:
+        raise ProviderError(
+            f'Alibaba Cloud MT returned a non-JSON response (HTTP {r.status_code}): '
+            f'{r.text[:800]}'
+        ) from e
+
+    code = d.get('Code')
+    if code is not None and str(code) != '200':
+        text = json.dumps(d, ensure_ascii=False)
+        low = text.lower()
+        if any(w in low for w in (
+            'quota', 'limit', 'throttl', 'too many',
+            'insufficient', 'free', 'balance', 'billing', 'overdue'
+        )):
+            raise QuotaError(f'Alibaba Cloud MT quota/billing/throttling error: {text[:1000]}')
+        raise ProviderError(f'Alibaba Cloud MT error: {text[:1000]}')
+    return d
+
+
+def _aliyun_looks_untranslated(source, translated):
+    s = re.sub(r'\s+', ' ', source or '').strip().lower()
+    t = re.sub(r'\s+', ' ', translated or '').strip().lower()
+    if not s or s != t:
+        return False
+    return bool(re.search(r'[A-Za-z]{3,}\s+[A-Za-z]{3,}', s))
+
+
+def _aliyun_params(engine, text):
+    if engine['action'] == 'TranslateGeneral':
+        return {
+            'FormatType': 'text',
+            'Scene': 'general',
+            'SourceLanguage': 'en',
+            'TargetLanguage': 'zh',
+            'SourceText': text,
+        }
+    return {
         'FormatType': 'text',
-        'Scene': 'general',
+        'Scene': engine['scene'],
         'SourceLanguage': 'en',
         'TargetLanguage': 'zh',
-        'SourceText': sample,
-    })
+        'SourceText': text,
+    }
+
+
+def check_aliyun(c, engine):
+    sample = 'This is a short sentence used only to verify the connection.'
+    d = aliyun_rpc(c, engine['action'], _aliyun_params(engine, sample))
     data = d.get('Data') or {}
     val = data.get('Translated') or data.get('TranslatedText')
     if not val:
@@ -568,46 +698,46 @@ def check_aliyun(c):
     if _aliyun_looks_untranslated(sample, val):
         raise ProviderError(
             'Alibaba Cloud MT accepted the request (HTTP 200, Code 200) but '
-            f'returned the English text unchanged instead of Chinese: {d}. '
-            'This usually means the Machine Translation service itself is '
-            'not enabled/subscribed on this account, or the AccessKey/RAM '
-            'user lacks the alimt:TranslateGeneral permission -- check the '
-            'Machine Translation console (机器翻译) "开通服务" status.'
+            'returned the English text unchanged instead of Chinese. '
+            'Check that the selected Machine Translation engine is enabled '
+            'and that the RAM user has the matching alimt:TranslateGeneral or '
+            'alimt:Translate permission.'
         )
-    print('[INFO] Alibaba Cloud MT connected.')
+    print(f'[INFO] Alibaba Cloud MT connected: {engine["name"]} / {engine["scene"]}')
 
 
-def translate_aliyun(texts, c):
+def translate_aliyun(texts, c, engine):
     out = []
     for x in texts:
-        d = aliyun_rpc(c, 'TranslateGeneral', {
-            'FormatType': 'text',
-            'Scene': 'general',
-            'SourceLanguage': 'en',
-            'TargetLanguage': 'zh',
-            'SourceText': x,
-        })
+        d = aliyun_rpc(c, engine['action'], _aliyun_params(engine, x))
         data = d.get('Data') or {}
         val = data.get('Translated') or data.get('TranslatedText')
         if val is None:
             raise ProviderError(str(d))
         if _aliyun_looks_untranslated(x, val):
             raise ProviderError(
-                'Alibaba Cloud MT returned the English text unchanged instead '
-                f'of translating it: {json.dumps(d, ensure_ascii=False)[:500]}'
+                'Alibaba Cloud MT returned the English text unchanged '
+                'instead of translating it: '
+                f'{json.dumps(d, ensure_ascii=False)[:500]}'
             )
         out.append(val)
     return out
 
 
-def provider_funcs(name):
+def provider_funcs(name, aliyun_engine=None):
+    if name == 'Alibaba Cloud MT':
+        if aliyun_engine is None:
+            raise ValueError('Alibaba Cloud engine must be selected before translation.')
+        return (
+            lambda c: check_aliyun(c, aliyun_engine),
+            lambda texts, c: translate_aliyun(texts, c, aliyun_engine),
+        )
     return {
         'DeepL': (check_deepl, translate_deepl),
         'Google Cloud Translation': (check_google, translate_google),
         'Microsoft Translator': (check_microsoft, translate_microsoft),
         'Amazon Translate': (check_amazon, translate_amazon),
         'Baidu Translate': (check_baidu, translate_baidu),
-        'Alibaba Cloud MT': (check_aliyun, translate_aliyun),
     }[name]
 
 
@@ -672,7 +802,7 @@ def _is_english_block(el):
 def _existing_bilingual_after(el):
     """Prevent duplicate Chinese paragraphs when rerunning on an output EPUB."""
     nxt = el.find_next_sibling()
-    if nxt and getattr(nxt, "name", None) == "p":
+    if nxt is not None:
         classes = nxt.get("class") or []
         if "bilingual-zh" in classes:
             return True
@@ -680,77 +810,71 @@ def _existing_bilingual_after(el):
 
 
 def process_xhtml(raw, translate_fn):
-    """Translate complete HTML/XHTML blocks without splitting inline markup.
-
-    Layout rule:
-        English block
-        Chinese block
-        English next block
-        Chinese next block
-
-    The original English block is left structurally intact. A new <p
-    class="bilingual-zh"> is inserted immediately after it.
-
-    Images, CSS links, attributes, inline <em>/<strong>/<a>/<span>, and all
-    non-text resources remain untouched.
-    """
+    """Translate blocks incrementally so a later failure can still publish
+    everything that was successfully translated earlier in this XHTML file."""
     soup = BeautifulSoup(raw, "html.parser")
-
     body = soup.find("body")
     if body is None:
-        return raw, 0, 0
+        return raw, 0, 0, False
 
-    # Snapshot the block elements BEFORE inserting any Chinese elements.
     blocks = [el for el in body.find_all(list(BLOCK_TAGS)) if _is_english_block(el)]
     if not blocks:
-        return raw, 0, 0
+        return raw, 0, 0, False
 
     texts = [_normal_text(el.get_text(" ", strip=True)) for el in blocks]
-    translations = []
-
-    # Each block remains one translation item. We batch several whole
-    # paragraphs only when the provider supports multiple inputs.
-    for i in range(0, len(texts), 20):
-        batch = texts[i:i + 20]
-        got = translate_fn(batch)
-
-        if len(got) != len(batch):
-            raise ProviderError(
-                f"Provider returned {len(got)} translations for {len(batch)} paragraphs."
-            )
-
-        if any(x is None or not str(x).strip() for x in got):
-            raise ProviderError("Provider returned an empty translation for a paragraph.")
-
-        translations.extend(str(x).strip() for x in got)
-        print(
-            f"      translated "
-            f"{min(i + len(batch), len(texts))}/{len(texts)} paragraphs"
-        )
-
-    # Do not modify the document until ALL translations for this XHTML have
-    # succeeded.
-    for el, zh in zip(blocks, translations):
-        if _existing_bilingual_after(el):
-            continue
-
-        p = soup.new_tag("p")
-        p["class"] = ["bilingual-zh"]
-        p.string = zh
-
-        # Insert immediately after the complete English block.
-        el.insert_after(p)
+    translated_count = 0
+    translated_chars = 0
 
     head = soup.find("head")
-    if head and not soup.find("style", attrs={"id": "bilingual-epub-style"}):
+    if head and not soup.find(True, attrs={"id": "bilingual-epub-style"}):
         st = soup.new_tag("style", id="bilingual-epub-style")
         st.string = (
-            ".bilingual-zh{display:block;margin:.35em 0 1em 0;}"
+            ".bilingual-zh{margin:.35em 0 1em 0;}"
             ".bilingual-zh + *{margin-top:0;}"
         )
         head.append(st)
 
-    return str(soup).encode("utf-8"), len(blocks), sum(len(x) for x in translations)
+    def insert_batch(batch_blocks, got):
+        nonlocal translated_count, translated_chars
+        if len(got) != len(batch_blocks):
+            raise ProviderError(
+                f"Provider returned {len(got)} translations for "
+                f"{len(batch_blocks)} paragraphs."
+            )
+        if any(x is None or not str(x).strip() for x in got):
+            raise ProviderError("Provider returned an empty translation for a paragraph.")
+
+        for el, zh in zip(batch_blocks, got):
+            if _existing_bilingual_after(el):
+                continue
+            p = soup.new_tag(el.name)
+            orig_classes = el.get("class") or []
+            p["class"] = list(orig_classes) + ["bilingual-zh"]
+            p.string = str(zh).strip()
+            el.insert_after(p)
+            translated_count += 1
+            translated_chars += len(str(zh).strip())
+
+    for i in range(0, len(texts), 20):
+        batch_blocks = blocks[i:i + 20]
+        batch = texts[i:i + 20]
+        try:
+            got = translate_fn(batch)
+            insert_batch(batch_blocks, got)
+        except Exception as exc:
+            # Attach the latest structurally valid XHTML state to the exception.
+            partial = str(soup).encode("utf-8")
+            wrapped = TranslationPartialError(
+                exc,
+                partial_epub=partial,
+                translated_any=translated_count > 0,
+            )
+            raise wrapped from exc
+
+        print(f"      translated {min(i + len(batch), len(texts))}/{len(texts)} paragraphs")
+
+    return str(soup).encode("utf-8"), translated_count, translated_chars, translated_count > 0
+
 
 def output_name(inp):
     return inp.with_name(inp.stem + '_EN-ZH.epub')
@@ -840,11 +964,51 @@ def epub_content_documents(zin, names):
         return _legacy_xhtml_filter(names)
 
 
-def run_translation(inp, out, trans, creds):
-    """Build a completely separate temporary EPUB and atomically publish it.
+def _validate_generated_epub(path, original_names):
+    with zipfile.ZipFile(path, 'r') as test:
+        test_names = test.namelist()
+        if not test_names or test_names[0] != 'mimetype':
+            raise ProviderError('Generated EPUB failed validation: mimetype is not the first ZIP entry.')
+        if test.getinfo('mimetype').compress_type != zipfile.ZIP_STORED:
+            raise ProviderError('Generated EPUB failed validation: mimetype is compressed.')
+        if 'META-INF/container.xml' not in test_names:
+            raise ProviderError('Generated EPUB failed validation: META-INF/container.xml missing.')
+        if test.read('mimetype').decode('utf-8', errors='replace').strip() != 'application/epub+zip':
+            raise ProviderError('Generated EPUB failed validation: invalid mimetype content.')
+        missing = [n for n in original_names if n not in test_names]
+        if missing:
+            raise ProviderError(
+                'Generated EPUB lost original resources: ' + ', '.join(missing[:10])
+            )
 
-    Existing output is NEVER deleted before successful completion. Therefore an
-    API/quota/network failure cannot produce or expose a partial new EPUB.
+
+def _write_checkpoint_epub(zin, names, xhtml_data):
+    """Create a complete EPUB snapshot from the original plus current XHTML data."""
+    fd, tmpname = tempfile.mkstemp(suffix='.checkpoint.epub')
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmpname, 'w') as zout:
+            if 'mimetype' in names:
+                zout.writestr('mimetype', zin.read('mimetype'), compress_type=zipfile.ZIP_STORED)
+            for namex in names:
+                if namex == 'mimetype':
+                    continue
+                zout.writestr(namex, xhtml_data.get(namex, zin.read(namex)))
+        return tmpname
+    except Exception:
+        if os.path.exists(tmpname):
+            os.unlink(tmpname)
+        raise
+
+
+def run_translation(inp, out, trans, creds):
+    """Translate with durable checkpoints.
+
+    After each successful paragraph batch, the in-memory XHTML is updated.
+    After each completed XHTML document, a complete valid EPUB checkpoint is
+    atomically published. If anything later fails, the last checkpoint remains
+    available. If a failure occurs inside a document, its successfully
+    translated batches are also published as a partial EPUB.
     """
     validate_epub(inp)
     if out == inp:
@@ -862,59 +1026,67 @@ def run_translation(inp, out, trans, creds):
                 'No translatable content documents were found in this EPUB '
                 '(checked the OPF manifest/spine and, as a fallback, common '
                 '.xhtml/.html/.htm extensions). Nothing would be translated, '
-                'so no output was written. This EPUB may use an unusual '
-                'internal structure -- please share it so the detection '
-                'logic can be extended.'
+                'so no output was written.'
             )
-        out.parent.mkdir(parents=True, exist_ok=True)
 
-        fd, tmpname = tempfile.mkstemp(
-            prefix=out.stem + '.', suffix='.tmp.epub', dir=str(out.parent)
-        )
-        os.close(fd)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        xhtml_data = {}
+        translated_any = False
+
+        # Start with all original resources. Nothing is published until the
+        # first successful translation, so "translation never happened" still
+        # produces no output.
+        for namex in names:
+            if namex != 'mimetype':
+                xhtml_data[namex] = zin.read(namex)
 
         try:
-            with zipfile.ZipFile(tmpname, 'w') as zout:
-                # EPUB requires mimetype to be the first ZIP entry and STORED.
-                if 'mimetype' in names:
-                    zout.writestr('mimetype', zin.read('mimetype'), compress_type=zipfile.ZIP_STORED)
-
-                for namex in names:
-                    if namex == 'mimetype':
-                        continue
-                    data = zin.read(namex)  # every non-XHTML resource is copied byte-for-byte
-                    if namex in xhtmls:
-                        pos = xhtmls.index(namex) + 1
-                        print(f'[INFO] [{pos}/{len(xhtmls)}] {namex}')
-                        data, _, _ = process_xhtml(data, lambda batch: trans(batch, creds))
-                    zout.writestr(namex, data)
-
-            # Structural validation before publishing the file.
-            with zipfile.ZipFile(tmpname, 'r') as test:
-                test_names = test.namelist()
-                if not test_names or test_names[0] != 'mimetype':
-                    raise ProviderError('Generated EPUB failed validation: mimetype is not the first ZIP entry.')
-                if test.getinfo('mimetype').compress_type != zipfile.ZIP_STORED:
-                    raise ProviderError('Generated EPUB failed validation: mimetype is compressed.')
-                if 'META-INF/container.xml' not in test_names:
-                    raise ProviderError('Generated EPUB failed validation: META-INF/container.xml missing.')
-                if test.read('mimetype').decode('utf-8', errors='replace').strip() != 'application/epub+zip':
-                    raise ProviderError('Generated EPUB failed validation: invalid mimetype content.')
-                # Every original ZIP entry must still exist. We only permit
-                # XHTML byte changes and the intentionally added bilingual CSS
-                # inside those XHTML documents.
-                missing = [n for n in names if n not in test_names]
-                if missing:
-                    raise ProviderError(
-                        'Generated EPUB lost original resources: ' + ', '.join(missing[:10])
+            for pos, namex in enumerate(xhtmls, 1):
+                print(f'[INFO] [{pos}/{len(xhtmls)}] {namex}')
+                original = xhtml_data[namex]
+                try:
+                    data, count, chars, did_translate = process_xhtml(
+                        original, lambda batch: trans(batch, creds)
                     )
+                except TranslationPartialError as exc:
+                    if exc.partial_epub is not None:
+                        xhtml_data[namex] = exc.partial_epub
+                    if exc.translated_any:
+                        translated_any = True
+                    # Publish a best-effort complete EPUB containing all
+                    # successful translations up to the failure.
+                    if translated_any:
+                        checkpoint = _write_checkpoint_epub(zin, names, xhtml_data)
+                        try:
+                            _validate_generated_epub(checkpoint, names)
+                            os.replace(checkpoint, out)
+                            checkpoint = None
+                            print(f'[PARTIAL] Published bilingual EPUB after failure: {out}')
+                        finally:
+                            if checkpoint and os.path.exists(checkpoint):
+                                os.unlink(checkpoint)
+                    raise exc.cause from exc
 
-            # Publish only after every document and validation step succeeded.
-            os.replace(tmpname, out)
-            tmpname = None
-        finally:
-            if tmpname and os.path.exists(tmpname):
-                os.unlink(tmpname)
+                xhtml_data[namex] = data
+                translated_any = translated_any or did_translate
+                if did_translate:
+                    checkpoint = _write_checkpoint_epub(zin, names, xhtml_data)
+                    try:
+                        _validate_generated_epub(checkpoint, names)
+                        os.replace(checkpoint, out)
+                        checkpoint = None
+                    finally:
+                        if checkpoint and os.path.exists(checkpoint):
+                            os.unlink(checkpoint)
+                    print(f'[CHECKPOINT] Saved progress: {out}')
+
+            if not translated_any:
+                raise ProviderError('No translation was actually performed; no output was written.')
+
+        except Exception:
+            # The latest published checkpoint is intentionally preserved.
+            # Never delete or overwrite it with the original English EPUB.
+            raise
 
 
 def main():
@@ -949,7 +1121,8 @@ def main():
             choice, name = choose_provider()
             creds, cred_path = credentials_for(choice, name, base, force_new=force_new)
             force_new = False
-            check, trans = provider_funcs(name)
+            aliyun_engine = choose_aliyun_engine() if name == 'Alibaba Cloud MT' else None
+            check, trans = provider_funcs(name, aliyun_engine)
             print(f'[INFO] Checking {name} credentials/quota...')
             check(creds)
 
@@ -985,13 +1158,18 @@ def main():
     print(f'[INFO] Input : {inp}')
     print(f'[INFO] Output: {out}')
     print(f'[INFO] API   : {name}')
+    if name == 'Alibaba Cloud MT':
+        print(f'[INFO] Engine: {aliyun_engine["name"]} / scene={aliyun_engine["scene"]}')
     print('[INFO] GPU   : not used')
 
     try:
         run_translation(inp, out, trans, creds)
     except QuotaError as e:
-        print(f'[QUOTA] Translation stopped before publishing output: {e}')
-        print('[INFO] No partial EPUB was published.')
+        print(f'[QUOTA] Translation stopped: {e}')
+        if out.exists():
+            print(f'[OUTPUT] Bilingual partial result preserved: {out}')
+        else:
+            print('[OUTPUT] No translation had completed, so no EPUB was written.')
         try:
             if cred_path.exists():
                 cred_path.unlink()
@@ -1001,8 +1179,11 @@ def main():
         print('[INFO] Run again and select another provider or enter a new key.')
         return 1
     except Exception as e:
-        print(f'[ERROR] Translation failed before publishing output: {e}')
-        print('[INFO] No partial EPUB was published. Any existing output file was preserved.')
+        print(f'[ERROR] Translation failed: {e}')
+        if out.exists():
+            print(f'[OUTPUT] Bilingual partial result preserved: {out}')
+        else:
+            print('[OUTPUT] Translation did not produce any completed result; no EPUB was written.')
         return 1
 
     print('=' * 68)
