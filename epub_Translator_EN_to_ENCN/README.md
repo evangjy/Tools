@@ -1,11 +1,11 @@
 EPUB bilingual translator - multi-provider edition
 
 Supported providers with verified free capacity >= 500k characters (2026-09-02):
-1. DeepL API Free - 1,000,000 chars/month
+1. DeepL API Free - 500,000 chars/month
 2. Google Cloud Translation - first 500,000 chars/month free
 3. Microsoft Translator - 2,000,000 chars/month free
 4. Amazon Translate - 2,000,000 chars/month free for 12 months
-5. Baidu Translate - 1,000,000 chars/month (plan eligibility applies)
+5. Baidu Translate - new-user 2,000,000 chars/month (plan eligibility applies)
 6. Alibaba Cloud Machine Translation - 1,000,000 chars/month free
 
 IMPORTANT:
