@@ -6,10 +6,12 @@ import zipfile
 import tempfile
 import hashlib
 import urllib.parse
+import posixpath
 import hmac
 import base64
 import json
 import shutil
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
@@ -482,21 +484,52 @@ def aliyun_rpc(c, action, params):
         'Format': 'JSON',
         'RegionId': c['region'],
         'SignatureMethod': 'HMAC-SHA1',
-        'SignatureNonce': str(time.time_ns()),
+        # Must be unique per request or Aliyun rejects it as a replay
+        # ("InvalidSignatureNonce.Used"). PID is appended for extra safety
+        # when calls happen faster than the clock resolution.
+        'SignatureNonce': f'{time.time_ns()}{os.getpid()}',
         'SignatureVersion': '1.0',
+        # REQUIRED public parameter. Without it the RPC signature is
+        # incomplete and Aliyun's gateway rejects the request before it ever
+        # reaches the Machine Translation backend -- which is exactly why
+        # nothing showed up in the MT console's call statistics.
+        'Timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'Version': '2018-10-12',
     }
     common.update(params)
+
+    # Sign over the sorted, percent-encoded parameter set (RPC signature
+    # mechanism). Signing is identical whether the params are sent via the
+    # query string or a POST body.
     qs = '&'.join(f'{percent_encode(k)}={percent_encode(common[k])}' for k in sorted(common))
-    signstr = 'GET&%2F&' + percent_encode(qs)
+    signstr = 'POST&%2F&' + percent_encode(qs)
     key = c['access_key_secret'] + '&'
     sig = base64.b64encode(hmac.new(key.encode(), signstr.encode(), hashlib.sha1).digest()).decode()
     common['Signature'] = sig
-    r = requests.get(endpoint, params=common, timeout=90)
+
+    # POST (not GET) so long paragraphs never risk silent truncation at a
+    # URL-length limit on some intermediate proxy/gateway.
+    r = requests.post(
+        endpoint,
+        data=common,
+        headers={'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'},
+        timeout=90,
+    )
     if r.status_code >= 400:
         _response_error('Alibaba Cloud MT', r)
-    d = r.json()
-    if 'Code' in d and d.get('Code') not in (None, '200'):
+
+    try:
+        d = r.json()
+    except ValueError as e:
+        raise ProviderError(
+            f'Alibaba Cloud MT returned a non-JSON response (HTTP {r.status_code}): '
+            f'{r.text[:800]}'
+        ) from e
+
+    # Code can come back as either an int (200) or a string ("200") depending
+    # on the response path, so compare as strings instead of `in (None, '200')`.
+    code = d.get('Code')
+    if code is not None and str(code) != '200':
         text = json.dumps(d, ensure_ascii=False)
         if any(w in text.lower() for w in ('quota', 'limit', 'throttl', 'too many')):
             raise QuotaError(f'Alibaba Cloud MT quota/throttling error: {text[:800]}')
@@ -504,15 +537,43 @@ def aliyun_rpc(c, action, params):
     return d
 
 
+def _aliyun_looks_untranslated(source, translated):
+    """Detect Aliyun MT echoing the English source back unchanged instead of
+    translating it (e.g. because the request was mis-routed/rejected
+    internally but still returned Code=200). This is what previously let a
+    fully-English "bilingual" EPUB get published with no visible error and
+    no entry in the MT console's usage log."""
+    s = re.sub(r'\s+', ' ', source or '').strip().lower()
+    t = re.sub(r'\s+', ' ', translated or '').strip().lower()
+    if not s or s != t:
+        return False
+    # Allow trivially "untranslated" text (numbers, single words, names) to
+    # pass; only flag real runs of English prose matching verbatim.
+    return bool(re.search(r'[A-Za-z]{3,}\s+[A-Za-z]{3,}', s))
+
+
 def check_aliyun(c):
+    sample = 'This is a short sentence used only to verify the connection.'
     d = aliyun_rpc(c, 'TranslateGeneral', {
         'FormatType': 'text',
+        'Scene': 'general',
         'SourceLanguage': 'en',
         'TargetLanguage': 'zh',
-        'SourceText': 'Hello',
+        'SourceText': sample,
     })
-    if 'Data' not in d:
-        raise ProviderError(str(d))
+    data = d.get('Data') or {}
+    val = data.get('Translated') or data.get('TranslatedText')
+    if not val:
+        raise ProviderError(f'Alibaba Cloud MT returned no translation: {d}')
+    if _aliyun_looks_untranslated(sample, val):
+        raise ProviderError(
+            'Alibaba Cloud MT accepted the request (HTTP 200, Code 200) but '
+            f'returned the English text unchanged instead of Chinese: {d}. '
+            'This usually means the Machine Translation service itself is '
+            'not enabled/subscribed on this account, or the AccessKey/RAM '
+            'user lacks the alimt:TranslateGeneral permission -- check the '
+            'Machine Translation console (机器翻译) "开通服务" status.'
+        )
     print('[INFO] Alibaba Cloud MT connected.')
 
 
@@ -521,6 +582,7 @@ def translate_aliyun(texts, c):
     for x in texts:
         d = aliyun_rpc(c, 'TranslateGeneral', {
             'FormatType': 'text',
+            'Scene': 'general',
             'SourceLanguage': 'en',
             'TargetLanguage': 'zh',
             'SourceText': x,
@@ -529,6 +591,11 @@ def translate_aliyun(texts, c):
         val = data.get('Translated') or data.get('TranslatedText')
         if val is None:
             raise ProviderError(str(d))
+        if _aliyun_looks_untranslated(x, val):
+            raise ProviderError(
+                'Alibaba Cloud MT returned the English text unchanged instead '
+                f'of translating it: {json.dumps(d, ensure_ascii=False)[:500]}'
+            )
         out.append(val)
     return out
 
@@ -689,6 +756,90 @@ def output_name(inp):
     return inp.with_name(inp.stem + '_EN-ZH.epub')
 
 
+def _legacy_xhtml_filter(names):
+    """Old extension-guessing heuristic. Kept only as a last-resort fallback
+    for EPUBs whose container.xml/OPF can't be parsed for some reason."""
+    return [
+        n for n in names
+        if n.lower().endswith(('.xhtml', '.html', '.htm'))
+        and '/nav' not in n.lower()
+        and not n.lower().endswith(('toc.xhtml', 'toc.html', 'toc.htm'))
+    ]
+
+
+def epub_content_documents(zin, names):
+    """Return the ZIP entry names of the EPUB's real content documents, in
+    spine order, by reading META-INF/container.xml -> the OPF manifest/spine
+    -- NOT by guessing from file extensions.
+
+    Many EPUBs (older titles, some publisher toolchains) ship XHTML content
+    under non-standard extensions such as .xml while still declaring
+    media-type="application/xhtml+xml" in the manifest. A pure
+    extension-based filter silently matches zero files for those books,
+    which produces a "successful" run that translates nothing and shows no
+    error at all -- exactly the "XHTML documents: 0" symptom.
+    """
+    try:
+        container = ET.fromstring(zin.read('META-INF/container.xml'))
+        ns = {'c': 'urn:oasis:names:tc:opendocument:xmlns:container'}
+        rootfile = container.find('.//c:rootfile', ns)
+        opf_path = rootfile.get('full-path') if rootfile is not None else None
+        if not opf_path or opf_path not in names:
+            return _legacy_xhtml_filter(names)
+
+        opf_dir = posixpath.dirname(opf_path)
+        opf = ET.fromstring(zin.read(opf_path))
+
+        def local(tag):
+            return tag.rsplit('}', 1)[-1]
+
+        manifest = {}
+        for item in opf.iter():
+            if local(item.tag) != 'item':
+                continue
+            item_id = item.get('id')
+            href = item.get('href')
+            if not item_id or not href:
+                continue
+            manifest[item_id] = (
+                urllib.parse.unquote(href),
+                (item.get('media-type') or '').strip().lower(),
+                (item.get('properties') or '').strip().lower(),
+            )
+
+        spine_idrefs = [
+            itemref.get('idref')
+            for itemref in opf.iter()
+            if local(itemref.tag) == 'itemref' and itemref.get('idref')
+        ]
+
+        text_media_types = ('application/xhtml+xml', 'application/x-dtbook+xml', 'text/html')
+        docs = []
+        for idref in spine_idrefs:
+            entry = manifest.get(idref)
+            if not entry:
+                continue
+            href, media_type, properties = entry
+            if 'nav' in properties.split():
+                continue  # EPUB3 navigation doc, not narrative content
+            if media_type not in text_media_types:
+                continue
+            full = posixpath.normpath(posixpath.join(opf_dir, href)) if opf_dir else href
+            full = full[2:] if full.startswith('./') else full
+            if full in names:
+                docs.append(full)
+            else:
+                # Try a case-insensitive match as a last resort (some tools
+                # write inconsistent casing between the manifest and the ZIP).
+                match = next((n for n in names if n.lower() == full.lower()), None)
+                if match:
+                    docs.append(match)
+
+        return docs or _legacy_xhtml_filter(names)
+    except Exception:
+        return _legacy_xhtml_filter(names)
+
+
 def run_translation(inp, out, trans, creds):
     """Build a completely separate temporary EPUB and atomically publish it.
 
@@ -704,13 +855,17 @@ def run_translation(inp, out, trans, creds):
 
     with zipfile.ZipFile(inp, 'r') as zin:
         names = zin.namelist()
-        xhtmls = [
-            n for n in names
-            if n.lower().endswith(('.xhtml', '.html', '.htm'))
-            and '/nav' not in n.lower()
-            and not n.lower().endswith(('toc.xhtml', 'toc.html', 'toc.htm'))
-        ]
+        xhtmls = epub_content_documents(zin, names)
         print(f'[INFO] XHTML documents: {len(xhtmls)}')
+        if not xhtmls:
+            raise ProviderError(
+                'No translatable content documents were found in this EPUB '
+                '(checked the OPF manifest/spine and, as a fallback, common '
+                '.xhtml/.html/.htm extensions). Nothing would be translated, '
+                'so no output was written. This EPUB may use an unusual '
+                'internal structure -- please share it so the detection '
+                'logic can be extended.'
+            )
         out.parent.mkdir(parents=True, exist_ok=True)
 
         fd, tmpname = tempfile.mkstemp(
